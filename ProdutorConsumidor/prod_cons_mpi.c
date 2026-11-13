@@ -19,28 +19,31 @@
 /* Estrutura do relógio vetorial */
 typedef struct Clock {
     int p[3];
-    int prod_id;    // Identificador para sabermos qual thread gerou
-    char acao[50];  // String para identificar o tipo de evento MPI
+    int prod_id;    
+    char acao[50];  
 } Clock;
 
+/* --- FILA COMPARTILHADA (PRODUTOR/CONSUMIDOR) --- */
 Clock queue[BUFFER_SIZE];
 int count = 0;
-
-pthread_mutex_t mutex;
+pthread_mutex_t mutex_fila;
 pthread_cond_t condFull;
 pthread_cond_t condEmpty;
 
-// Variáveis globais do MPI para as threads saberem quem são
+/* --- RELÓGIO VETORIAL DO PROCESSO MPI --- */
+// Pertence ao processo como um todo, protegido por um mutex próprio.
+Clock relogio_processo = {{0, 0, 0}, -1, "Init"};
+pthread_mutex_t mutex_relogio;
+
 int my_rank;
 int comm_sz;
 
-/* Extrai da fila protegida */
+/* --- FUNÇÕES DA FILA --- */
 Clock getClock(int id) {
-    pthread_mutex_lock(&mutex);
+    pthread_mutex_lock(&mutex_fila);
 
     while (count == 0) {
-        printf("[P%d - Consumidor %d] Fila VAZIA! Condição bloqueando...\n", my_rank, id);
-        pthread_cond_wait(&condEmpty, &mutex);
+        pthread_cond_wait(&condEmpty, &mutex_fila);
     }
 
     Clock clock = queue[0];
@@ -49,104 +52,118 @@ Clock getClock(int id) {
     }
     count--;
 
-    pthread_mutex_unlock(&mutex);
+    pthread_mutex_unlock(&mutex_fila);
     pthread_cond_signal(&condFull);
 
     return clock;
 }
 
-/* Insere na fila protegida */
 void submitClock(Clock clock, int id) {
-    pthread_mutex_lock(&mutex);
+    pthread_mutex_lock(&mutex_fila);
 
     while (count == BUFFER_SIZE) {
-        printf("[P%d - Produtor %d] Fila CHEIA! Condição bloqueando...\n", my_rank, id);
-        pthread_cond_wait(&condFull, &mutex);
+        pthread_cond_wait(&condFull, &mutex_fila);
     }
 
     queue[count] = clock;
     count++;
 
-    pthread_mutex_unlock(&mutex);
+    pthread_mutex_unlock(&mutex_fila);
     pthread_cond_signal(&condEmpty);
 }
 
-/* --- INTEGRAÇÃO DAS FUNÇÕES DO RELÓGIO VETORIAL COM MPI --- */
+/* --- FUNÇÕES DO RELÓGIO VETORIAL (AGORA ACESSAM A VARIÁVEL GLOBAL) --- */
 
-void Event(Clock *clock, int id_thread) {
-    clock->p[my_rank]++;
-    clock->prod_id = id_thread;
-    sprintf(clock->acao, "Evento Interno");
+void Event(int id_thread) {
+    pthread_mutex_lock(&mutex_relogio);
     
-    // O produtor submete o estado na fila
-    submitClock(*clock, id_thread);
+    relogio_processo.p[my_rank]++; // Incrementa o índice deste processo
+    relogio_processo.prod_id = id_thread;
+    sprintf(relogio_processo.acao, "Evento Interno");
+    
+    Clock copia_para_fila = relogio_processo; // Salva o estado atual
+    pthread_mutex_unlock(&mutex_relogio);
+    
+    submitClock(copia_para_fila, id_thread);
 }
 
-void Send(int dest, Clock *clock, int id_thread) {
-    clock->p[my_rank]++;
-    clock->prod_id = id_thread;
-    sprintf(clock->acao, "Send para P%d", dest);
+void Send(int dest, int id_thread) {
+    pthread_mutex_lock(&mutex_relogio);
     
-    // Envio MPI
-    MPI_Send(clock->p, 3, MPI_INT, dest, 0, MPI_COMM_WORLD);
+    relogio_processo.p[my_rank]++;
+    relogio_processo.prod_id = id_thread;
+    sprintf(relogio_processo.acao, "Send para P%d", dest);
     
-    // O produtor submete o estado na fila
-    submitClock(*clock, id_thread);
+    int buffer_envio[3] = {relogio_processo.p[0], relogio_processo.p[1], relogio_processo.p[2]};
+    Clock copia_para_fila = relogio_processo;
+    pthread_mutex_unlock(&mutex_relogio);
+    
+    // O MPI_Send fica fora do mutex para não travar outras threads desnecessariamente
+    MPI_Send(buffer_envio, 3, MPI_INT, dest, 0, MPI_COMM_WORLD);
+    submitClock(copia_para_fila, id_thread);
 }
 
-void Receive(int src, Clock *clock, int id_thread) {
+void Receive(int src, int id_thread) {
     int recebe[3];
     
-    // Recebimento MPI
+    // Aguarda receber a mensagem livremente
     MPI_Recv(recebe, 3, MPI_INT, src, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     
-    clock->p[my_rank]++;
+    // Ao receber, trava o relógio para fazer a sincronização
+    pthread_mutex_lock(&mutex_relogio);
+    relogio_processo.p[my_rank]++;
     for (int i = 0; i < 3; i++) {
-        if (clock->p[i] < recebe[i]) {
-            clock->p[i] = recebe[i];
+        if (relogio_processo.p[i] < recebe[i]) {
+            relogio_processo.p[i] = recebe[i];
         }
     }
-    clock->prod_id = id_thread;
-    sprintf(clock->acao, "Receive de P%d", src);
+    relogio_processo.prod_id = id_thread;
+    sprintf(relogio_processo.acao, "Receive de P%d", src);
     
-    // O produtor submete o estado na fila
-    submitClock(*clock, id_thread);
+    Clock copia_para_fila = relogio_processo;
+    pthread_mutex_unlock(&mutex_relogio);
+    
+    submitClock(copia_para_fila, id_thread);
 }
 
-/* Thread Produtora */
+/* --- THREADS PRODUTORAS E CONSUMIDORAS --- */
+
 void* producerThread(void* arg) {
     int id = *(int*)arg;
-    Clock clock = {{0, 0, 0}, id, ""};
-    
-    // Cálculo seguro de nós adjacentes para envio e recebimento em anel
     int next_proc = (my_rank + 1) % comm_sz;
     int prev_proc = (my_rank - 1 + comm_sz) % comm_sz;
 
     while (1) {
-        // 1. Gera Evento Interno
-        Event(&clock, id);
+        Event(id);
         if (CENARIO == 1) sleep(1); else sleep(2);
 
-        // 2. Envia relógio para o vizinho da frente
-        Send(next_proc, &clock, id);
+        Send(next_proc, id);
         if (CENARIO == 1) sleep(1); else sleep(2);
 
-        // 3. Recebe relógio do vizinho de trás
-        Receive(prev_proc, &clock, id);
+        Receive(prev_proc, id);
         if (CENARIO == 1) sleep(1); else sleep(2);
     }
     return NULL;
 }
 
-/* Thread Consumidora */
 void* consumerThread(void* arg) {
     int id = *(int*)arg;
 
     while (1) {
         Clock clock = getClock(id);
 
-        printf("   [P%d] [Consumidor %d] Leu da fila: [%-15s] -> Clock = (%d, %d, %d) [Produtor %d]\n",
-                my_rank, id, clock.acao, clock.p[0], clock.p[1], clock.p[2], clock.prod_id);
+        // Formatação visual para separar os prints por colunas no terminal
+        if (my_rank == 0) {
+            printf("[P0] Cons %d | %-16s -> (%d, %d, %d) [Prod %d]\n", 
+                   id, clock.acao, clock.p[0], clock.p[1], clock.p[2], clock.prod_id);
+        } else if (my_rank == 1) {
+            printf("\t\t\t\t[P1] Cons %d | %-16s -> (%d, %d, %d) [Prod %d]\n", 
+                   id, clock.acao, clock.p[0], clock.p[1], clock.p[2], clock.prod_id);
+        } else {
+            printf("\t\t\t\t\t\t\t\t[P2] Cons %d | %-16s -> (%d, %d, %d) [Prod %d]\n", 
+                   id, clock.acao, clock.p[0], clock.p[1], clock.p[2], clock.prod_id);
+        }
+        fflush(stdout); // Força a impressão imediata para não embaralhar
 
         if (CENARIO == 1) sleep(2); else sleep(1);
     }
@@ -156,16 +173,12 @@ void* consumerThread(void* arg) {
 int main(int argc, char* argv[]) {
     int provided;
     
-    // MPI_Init_thread é crucial aqui, pois múltiplas threads farão chamadas MPI simultaneamente
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    if (provided < MPI_THREAD_MULTIPLE) {
-        printf("Aviso: A implementação MPI não suporta MPI_THREAD_MULTIPLE de forma nativa.\n");
-    }
-    
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_sz);
 
-    pthread_mutex_init(&mutex, NULL);
+    pthread_mutex_init(&mutex_fila, NULL);
+    pthread_mutex_init(&mutex_relogio, NULL); // Inicializa o novo mutex do relógio
     pthread_cond_init(&condEmpty, NULL);
     pthread_cond_init(&condFull, NULL);
 
@@ -174,10 +187,8 @@ int main(int argc, char* argv[]) {
     int ids[3] = {0, 1, 2};
 
     if (my_rank == 0) {
-        printf("\n--- INICIANDO EXECUÇÃO HÍBRIDA (MPI + Pthreads) : CENÁRIO %d ---\n\n", CENARIO);
+        printf("\n--- INICIANDO EXECUÇÃO: CENÁRIO %d ---\n\n", CENARIO);
     }
-    
-    // Pequeno sleep para garantir que o cabeçalho imprime antes das operações
     sleep(1);
 
     for (int i = 0; i < NUM_PRODUTORES; i++) {
@@ -194,7 +205,8 @@ int main(int argc, char* argv[]) {
         pthread_join(consumidores[i], NULL);
     }
 
-    pthread_mutex_destroy(&mutex);
+    pthread_mutex_destroy(&mutex_fila);
+    pthread_mutex_destroy(&mutex_relogio);
     pthread_cond_destroy(&condEmpty);
     pthread_cond_destroy(&condFull);
     
