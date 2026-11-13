@@ -1,4 +1,4 @@
-# Etapa1-RelogiosVetoriais
+# Projeto PPC
 
 Alunos: Evandro José dos Santos Neto, Kelvin Fagundes Gomes de Souza e Mizael Paris Leite
 
