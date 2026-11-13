@@ -10,19 +10,19 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE 5       // Tamanho reduzido para forçar o encher/esvaziar da fila rapidamente
-#define NUM_PRODUTORES 3    // Quantidade de threads produtoras
-#define NUM_CONSUMIDORES 3  // Quantidade de threads consumidoras
+#define BUFFER_SIZE 5       
+#define NUM_PRODUTORES 3    
+#define NUM_CONSUMIDORES 3 
 
 // DEFINA O CENÁRIO AQUI:
-// 1 = Cenário Fila Cheia (Produtores rápidos, Consumidores lentos)
-// 2 = Cenário Fila Vazia (Produtores lentos, Consumidores rápidos)
+// 1 = Cenário Fila Cheia 
+// 2 = Cenário Fila Vazia 
 #define CENARIO 1
 
-/* Estrutura do relógio vetorial (baseado no main.c) */
+/* Estrutura do relógio vetorial*/
 typedef struct Clock {
     int p[3];
-    int prod_id;    // Identificador para sabermos qual thread gerou
+    int prod_id;    // Identificador do produto p saber qual thread gerou
 } Clock;
 
 Clock queue[BUFFER_SIZE];
@@ -147,7 +147,6 @@ int main(int argc, char* argv[]) {
     }
 
     // O programa roda num loop infinito por conta do while(1) das threads.
-    // Usar 'Ctrl+C' para finalizar a simulação.
     for (int i = 0; i < NUM_PRODUTORES; i++) {
         pthread_join(produtores[i], NULL);
     }
