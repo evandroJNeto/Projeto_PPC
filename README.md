@@ -2,7 +2,7 @@
 
 Alunos: Evandro José dos Santos Neto, Kelvin Fagundes Gomes de Souza e Mizael Paris Leite
 
-Este repositório contém a Etapa 1, Etapa 2 e 3 do trabalho.
+Este repositório contém a Etapa 1, Etapa 2 e 3 do trabalho referente a disciplina de Programação Paralela e Concorrente.
 
 ## Produtor-Consumidor (prod_cons.c)
 
